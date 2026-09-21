@@ -1,0 +1,18 @@
+# macOS metadata
+.DS_Store
+
+# Swift build products and local caches
+.build/
+DerivedData/
+.swiftpm/
+
+# Local app bundles and release archives
+outputs/
+
+# Recovery data and verified local checkpoints
+# These may contain real note text and background images.
+work/
+
+# Xcode user-specific state
+*.xcuserstate
+xcuserdata/
