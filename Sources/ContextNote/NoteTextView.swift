@@ -44,7 +44,6 @@ struct NoteTextView: NSViewRepresentable {
         editor.delegate = context.coordinator
         editor.profileID = store.activeProfileID
         scrollView.documentView = editor
-        context.coordinator.profileID = store.activeProfileID
         store.editorSnapshot = { [weak editor] in
             guard let editor, let id = editor.profileID else { return nil }
             return (id, editor.string)
@@ -63,7 +62,6 @@ struct NoteTextView: NSViewRepresentable {
             editor.scrollToBeginningOfDocument(nil)
         }
         editor.profileID = store.activeProfileID
-        context.coordinator.profileID = store.activeProfileID
         editor.applyTextColor(store.textColor)
         editor.completedLineIndexes = store.completedLineIndexes
         editor.textIsLocked = store.isTextLocked
@@ -74,7 +72,6 @@ struct NoteTextView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         let store: NoteStore
-        var profileID: UUID?
         init(store: NoteStore) { self.store = store }
         func textDidChange(_ notification: Notification) {
             guard let editor = notification.object as? NoteEditor,

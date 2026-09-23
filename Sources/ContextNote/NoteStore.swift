@@ -123,6 +123,26 @@ private struct BackupPreferences: Codable {
 
 @MainActor
 final class NoteStore: ObservableObject {
+    private enum Keys {
+        static let alwaysOnTop = "alwaysOnTop"
+        static let showOnAllSpaces = "showOnAllSpaces"
+        static let showStatusItem = "showStatusItem"
+        static let completionBehavior = "completionBehavior"
+        static let defaultShowInFullscreen = "defaultShowInFullscreen"
+        static let suggestionsEnabled = "suggestionsEnabled"
+        static let ignoredSuggestionIDs = "ignoredSuggestionIDs"
+        static let profiles = "profiles"
+        static let profilesBackup = "profilesBackup"
+        static let appRules = "appRules"
+        static let appRulesBackup = "appRulesBackup"
+        static let windowFrame = "noteWindowFrame"
+
+        // Keys used only when importing data from the original MVP.
+        static let legacyText = "noteText"
+        static let legacyBackgroundImage = "backgroundImage"
+        static let legacyImageOpacity = "imageOpacity"
+    }
+
     weak var panelWindow: NSWindow?
     var windowBehaviorChanged: (() -> Void)?
     var statusItemVisibilityChanged: (() -> Void)?
@@ -132,19 +152,19 @@ final class NoteStore: ObservableObject {
     @Published var showingSettings = false
     @Published var alwaysOnTop: Bool {
         didSet {
-            defaults.set(alwaysOnTop, forKey: "alwaysOnTop")
+            defaults.set(alwaysOnTop, forKey: Keys.alwaysOnTop)
             windowBehaviorChanged?()
         }
     }
     @Published var showOnAllSpaces: Bool {
         didSet {
-            defaults.set(showOnAllSpaces, forKey: "showOnAllSpaces")
+            defaults.set(showOnAllSpaces, forKey: Keys.showOnAllSpaces)
             windowBehaviorChanged?()
         }
     }
     @Published var showStatusItem: Bool {
         didSet {
-            defaults.set(showStatusItem, forKey: "showStatusItem")
+            defaults.set(showStatusItem, forKey: Keys.showStatusItem)
             statusItemVisibilityChanged?()
         }
     }
@@ -152,21 +172,20 @@ final class NoteStore: ObservableObject {
         didSet { updateLaunchAtLoginRegistration() }
     }
     @Published var completionBehavior: CompletionBehavior {
-        didSet { defaults.set(completionBehavior.rawValue, forKey: "completionBehavior") }
+        didSet { defaults.set(completionBehavior.rawValue, forKey: Keys.completionBehavior) }
     }
     @Published private(set) var launchAtLoginMessage: String?
     @Published var defaultShowInFullscreen: Bool {
         didSet {
-            defaults.set(defaultShowInFullscreen, forKey: "defaultShowInFullscreen")
+            defaults.set(defaultShowInFullscreen, forKey: Keys.defaultShowInFullscreen)
             windowBehaviorChanged?()
         }
     }
     @Published var newProfileName = ""
     @Published var suggestion: AppSuggestion?
-    @Published private(set) var contentOpacity = 1.0
     @Published var suggestionsEnabled: Bool {
         didSet {
-            defaults.set(suggestionsEnabled, forKey: "suggestionsEnabled")
+            defaults.set(suggestionsEnabled, forKey: Keys.suggestionsEnabled)
             if !suggestionsEnabled { suggestionTask?.cancel(); suggestion = nil }
         }
     }
@@ -177,9 +196,7 @@ final class NoteStore: ObservableObject {
     @Published private(set) var activeProfileID: UUID
 
     private let defaults: UserDefaults
-    private let frameKey = "noteWindowFrame"
     private var suggestionTask: Task<Void, Never>?
-    private var switchTask: Task<Void, Never>?
     private var lastActivatedBundleID: String?
     private var ignoredSuggestionIDs: Set<String>
     private var snoozedSuggestionIDs = Set<String>()
@@ -250,39 +267,39 @@ final class NoteStore: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        alwaysOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
-        showOnAllSpaces = defaults.object(forKey: "showOnAllSpaces") as? Bool ?? true
-        showStatusItem = defaults.object(forKey: "showStatusItem") as? Bool ?? true
+        alwaysOnTop = defaults.object(forKey: Keys.alwaysOnTop) as? Bool ?? true
+        showOnAllSpaces = defaults.object(forKey: Keys.showOnAllSpaces) as? Bool ?? true
+        showStatusItem = defaults.object(forKey: Keys.showStatusItem) as? Bool ?? true
         let loginStatus = SMAppService.mainApp.status
         launchAtLogin = loginStatus == .enabled || loginStatus == .requiresApproval
         launchAtLoginMessage = loginStatus == .requiresApproval ? "需要在系统设置的登录项中批准" : nil
-        completionBehavior = CompletionBehavior(rawValue: defaults.string(forKey: "completionBehavior") ?? "") ?? .strikethrough
-        defaultShowInFullscreen = defaults.object(forKey: "defaultShowInFullscreen") as? Bool ?? true
-        suggestionsEnabled = defaults.object(forKey: "suggestionsEnabled") as? Bool ?? true
-        ignoredSuggestionIDs = Set(defaults.stringArray(forKey: "ignoredSuggestionIDs") ?? [])
+        completionBehavior = CompletionBehavior(rawValue: defaults.string(forKey: Keys.completionBehavior) ?? "") ?? .strikethrough
+        defaultShowInFullscreen = defaults.object(forKey: Keys.defaultShowInFullscreen) as? Bool ?? true
+        suggestionsEnabled = defaults.object(forKey: Keys.suggestionsEnabled) as? Bool ?? true
+        ignoredSuggestionIDs = Set(defaults.stringArray(forKey: Keys.ignoredSuggestionIDs) ?? [])
         let loadedProfiles: [NoteProfile]
-        if let data = defaults.data(forKey: "profiles"),
+        if let data = defaults.data(forKey: Keys.profiles),
            let saved = Self.decodeProfiles(from: data) {
             loadedProfiles = saved
-        } else if let backupData = defaults.data(forKey: "profilesBackup"),
+        } else if let backupData = defaults.data(forKey: Keys.profilesBackup),
                   let saved = Self.decodeProfiles(from: backupData) {
             loadedProfiles = saved
-            defaults.set(backupData, forKey: "profiles")
+            defaults.set(backupData, forKey: Keys.profiles)
         } else {
             // Import the original MVP note on first launch after this upgrade.
             loadedProfiles = [NoteProfile(id: UUID(), name: "今日总计划",
-                text: defaults.string(forKey: "noteText") ?? "今天：\n- 算法\n- Java\n- 作业",
-                imageData: defaults.data(forKey: "backgroundImage"),
-                imageOpacity: defaults.object(forKey: "imageOpacity") as? Double ?? 0.65)]
+                text: defaults.string(forKey: Keys.legacyText) ?? "今天：\n- 算法\n- Java\n- 作业",
+                imageData: defaults.data(forKey: Keys.legacyBackgroundImage),
+                imageOpacity: defaults.object(forKey: Keys.legacyImageOpacity) as? Double ?? 0.65)]
         }
         profiles = loadedProfiles
-        if let data = defaults.data(forKey: "appRules"),
+        if let data = defaults.data(forKey: Keys.appRules),
            let saved = try? JSONDecoder().decode([AppRule].self, from: data) {
             rules = saved
-        } else if let backupData = defaults.data(forKey: "appRulesBackup"),
+        } else if let backupData = defaults.data(forKey: Keys.appRulesBackup),
                   let saved = try? JSONDecoder().decode([AppRule].self, from: backupData) {
             rules = saved
-            defaults.set(backupData, forKey: "appRules")
+            defaults.set(backupData, forKey: Keys.appRules)
         } else {
             rules = []
         }
@@ -494,8 +511,9 @@ final class NoteStore: ObservableObject {
 
     func addProfile() {
         let name = newProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let profile = NoteProfile(id: UUID(), name: name.isEmpty ? "新便签 \(profiles.count)" : name,
-                                  text: "", imageData: nil, imageOpacity: 0.65)
+        let profile = Self.makeEmptyProfile(
+            named: name.isEmpty ? "新便签 \(profiles.count)" : name
+        )
         profiles.append(profile)
         newProfileName = ""
         switchProfile(to: profile.id)
@@ -519,8 +537,6 @@ final class NoteStore: ObservableObject {
         alert.addButton(withTitle: "取消")
         guard runSystemModal({ alert.runModal() }) == .alertFirstButtonReturn else { return }
         flushText()
-        switchTask?.cancel()
-        contentOpacity = 1
         if activeProfileID == id {
             activeProfileID = defaultProfileID
         }
@@ -528,14 +544,9 @@ final class NoteStore: ObservableObject {
     }
 
     private func switchProfile(to id: UUID) {
-        switchTask?.cancel()
         flushText()
-        guard activeProfileID != id else {
-            contentOpacity = 1
-            return
-        }
+        guard activeProfileID != id else { return }
         activeProfileID = id
-        contentOpacity = 1
     }
 
     func renameProfile(_ id: UUID, to name: String) {
@@ -642,8 +653,7 @@ final class NoteStore: ObservableObject {
             self.suggestion = nil
             return
         }
-        let profile = NoteProfile(id: UUID(), name: "\(suggestion.appName) 便签",
-                                  text: "", imageData: nil, imageOpacity: 0.65)
+        let profile = Self.makeEmptyProfile(named: "\(suggestion.appName) 便签")
         profiles.append(profile)
         rules.append(AppRule(id: UUID(), bundleIdentifier: suggestion.bundleIdentifier,
                              appName: suggestion.appName, appPath: suggestion.appPath,
@@ -661,17 +671,17 @@ final class NoteStore: ObservableObject {
     func neverSuggestCurrentApp() {
         if let suggestion {
             ignoredSuggestionIDs.insert(suggestion.bundleIdentifier)
-            defaults.set(Array(ignoredSuggestionIDs), forKey: "ignoredSuggestionIDs")
+            defaults.set(Array(ignoredSuggestionIDs), forKey: Keys.ignoredSuggestionIDs)
         }
         suggestion = nil
     }
 
     func refreshForFrontmostApp() { handleActivatedApp(NSWorkspace.shared.frontmostApplication) }
 
-    func save(frame: NSRect) { defaults.set(NSStringFromRect(frame), forKey: frameKey) }
+    func save(frame: NSRect) { defaults.set(NSStringFromRect(frame), forKey: Keys.windowFrame) }
 
     func restoredFrame() -> NSRect? {
-        guard let value = defaults.string(forKey: frameKey) else { return nil }
+        guard let value = defaults.string(forKey: Keys.windowFrame) else { return nil }
         return Self.validatedFrame(value)
     }
 
@@ -707,7 +717,7 @@ final class NoteStore: ObservableObject {
                 completionBehavior: completionBehavior.rawValue,
                 ignoredSuggestionIDs: Array(ignoredSuggestionIDs),
                 windowFrame: panelWindow.map { NSStringFromRect($0.frame) }
-                    ?? defaults.string(forKey: frameKey)
+                    ?? defaults.string(forKey: Keys.windowFrame)
             )
             let backup = NoteBackup(formatVersion: 1, exportedAt: Date(),
                                     profiles: profiles, rules: rules,
@@ -752,7 +762,6 @@ final class NoteStore: ObservableObject {
         flushText()
         textPersistenceTask?.cancel()
         textPersistenceTask = nil
-        switchTask?.cancel()
         suggestionTask?.cancel()
         suggestion = nil
         imageCache.removeAll()
@@ -768,14 +777,13 @@ final class NoteStore: ObservableObject {
             completionBehavior = CompletionBehavior(rawValue: preferences.completionBehavior)
                 ?? .strikethrough
             ignoredSuggestionIDs = Set(preferences.ignoredSuggestionIDs)
-            defaults.set(Array(ignoredSuggestionIDs), forKey: "ignoredSuggestionIDs")
+            defaults.set(Array(ignoredSuggestionIDs), forKey: Keys.ignoredSuggestionIDs)
             if let value = preferences.windowFrame,
                let frame = Self.validatedFrame(value) {
-                defaults.set(value, forKey: frameKey)
+                defaults.set(value, forKey: Keys.windowFrame)
                 panelWindow?.setFrame(frame, display: true)
             }
         }
-        contentOpacity = 1
         windowBehaviorChanged?()
         showBackupAlert(title: "备份已恢复", message: "已恢复 \(profiles.count) 个便签。")
     }
@@ -792,6 +800,10 @@ final class NoteStore: ObservableObject {
               !profiles.isEmpty,
               Set(profiles.map(\.id)).count == profiles.count else { return nil }
         return profiles
+    }
+
+    private static func makeEmptyProfile(named name: String) -> NoteProfile {
+        NoteProfile(id: UUID(), name: name, text: "", imageData: nil, imageOpacity: 0.65)
     }
 
     private func showBackupAlert(title: String, message: String) {
@@ -824,17 +836,17 @@ final class NoteStore: ObservableObject {
 
     private func persistProfiles() {
         guard let data = try? JSONEncoder().encode(profiles) else { return }
-        if let previous = defaults.data(forKey: "profiles"), previous != data {
-            defaults.set(previous, forKey: "profilesBackup")
+        if let previous = defaults.data(forKey: Keys.profiles), previous != data {
+            defaults.set(previous, forKey: Keys.profilesBackup)
         }
-        defaults.set(data, forKey: "profiles")
+        defaults.set(data, forKey: Keys.profiles)
     }
 
     private func persistRules() {
         guard let data = try? JSONEncoder().encode(rules) else { return }
-        if let previous = defaults.data(forKey: "appRules"), previous != data {
-            defaults.set(previous, forKey: "appRulesBackup")
+        if let previous = defaults.data(forKey: Keys.appRules), previous != data {
+            defaults.set(previous, forKey: Keys.appRulesBackup)
         }
-        defaults.set(data, forKey: "appRules")
+        defaults.set(data, forKey: Keys.appRules)
     }
 }

@@ -29,7 +29,6 @@ struct NoteView: View {
                             .font(.system(size: 12, weight: .semibold))
                             .padding(.leading, 6)
                             .shadow(color: .black.opacity(0.8), radius: 2)
-                            .opacity(store.contentOpacity)
                             .lineLimit(1)
                             .allowsHitTesting(false)
                     }
@@ -72,7 +71,6 @@ struct NoteView: View {
                 NoteTextView(store: store)
                     .id(store.activeProfileID)
                     .background(.black.opacity(store.appearanceMode == .image ? 0.12 : 0))
-                    .opacity(store.contentOpacity)
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -82,7 +80,6 @@ struct NoteView: View {
                     VisualEffectBackground(opacity: store.glassOpacity, style: store.glassStyle)
                     if store.appearanceMode == .solid {
                         Color(nsColor: store.solidColor)
-                            .opacity(store.contentOpacity)
                     }
                     if let image = store.visibleBackgroundImage {
                         Group {
@@ -102,11 +99,11 @@ struct NoteView: View {
                             .clipped()
                             .brightness(store.imageBrightness - 1)
                             .blur(radius: store.imageBlur)
-                            .opacity(store.imageOpacity * store.contentOpacity)
+                            .opacity(store.imageOpacity)
                     }
                     // The tint affects the background only; editing controls stay above it.
                     Color.black.opacity(store.appearanceMode == .glass ? 0.08 :
-                        (store.appearanceMode == .image ? store.overlayOpacity * store.contentOpacity : 0))
+                        (store.appearanceMode == .image ? store.overlayOpacity : 0))
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .clipped()
