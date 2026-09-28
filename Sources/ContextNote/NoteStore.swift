@@ -146,6 +146,7 @@ final class NoteStore: ObservableObject {
     weak var panelWindow: NSWindow?
     var windowBehaviorChanged: (() -> Void)?
     var statusItemVisibilityChanged: (() -> Void)?
+    var noteHiddenByUser: (() -> Void)?
     var editorSnapshot: (() -> (UUID, String)?)?
     @Published var isHovering = false
     @Published var showingAppearance = false
@@ -293,11 +294,12 @@ final class NoteStore: ObservableObject {
                 imageOpacity: defaults.object(forKey: Keys.legacyImageOpacity) as? Double ?? 0.65)]
         }
         profiles = loadedProfiles
+        let profileIDs = Set(loadedProfiles.map(\.id))
         if let data = defaults.data(forKey: Keys.appRules),
-           let saved = try? JSONDecoder().decode([AppRule].self, from: data) {
+           let saved = Self.decodeRules(from: data, validProfileIDs: profileIDs) {
             rules = saved
         } else if let backupData = defaults.data(forKey: Keys.appRulesBackup),
-                  let saved = try? JSONDecoder().decode([AppRule].self, from: backupData) {
+                  let saved = Self.decodeRules(from: backupData, validProfileIDs: profileIDs) {
             rules = saved
             defaults.set(backupData, forKey: Keys.appRules)
         } else {
@@ -337,6 +339,7 @@ final class NoteStore: ObservableObject {
         flushText()
         showingAppearance = false
         showingSettings = false
+        noteHiddenByUser?()
         panelWindow?.orderOut(nil)
     }
     func toggleCompletedLine(_ lineIndex: Int) {
@@ -689,12 +692,12 @@ final class NoteStore: ObservableObject {
         let frame = NSRectFromString(value)
         guard frame.width.isFinite, frame.height.isFinite,
               frame.width >= 220, frame.height >= 180 else { return nil }
-        if let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main {
-            let bounds = screen.visibleFrame
-            if frame.width >= bounds.width - 20 || frame.height >= bounds.height - 20 {
-                return nil
-            }
-        }
+        guard let screen = NSScreen.screens.first(where: { screen in
+            let visiblePart = screen.visibleFrame.intersection(frame)
+            return !visiblePart.isNull && visiblePart.width >= 80 && visiblePart.height >= 60
+        }) else { return nil }
+        let bounds = screen.visibleFrame
+        guard frame.width < bounds.width - 20, frame.height < bounds.height - 20 else { return nil }
         return frame
     }
 
@@ -746,8 +749,15 @@ final class NoteStore: ObservableObject {
         }
 
         let profileIDs = Set(backup.profiles.map(\.id))
+        let ruleIDs = Set(backup.rules.map(\.id))
+        let bundleIDs = Set(backup.rules.map(\.bundleIdentifier))
         guard backup.formatVersion == 1, !backup.profiles.isEmpty,
-              profileIDs.count == backup.profiles.count else {
+              profileIDs.count == backup.profiles.count,
+              ruleIDs.count == backup.rules.count,
+              bundleIDs.count == backup.rules.count,
+              backup.rules.allSatisfy({
+                  !$0.bundleIdentifier.isEmpty && profileIDs.contains($0.profileID)
+              }) else {
             showBackupAlert(title: "无法读取备份", message: "备份内容不完整或版本不受支持。")
             return
         }
@@ -767,7 +777,7 @@ final class NoteStore: ObservableObject {
         imageCache.removeAll()
         activeProfileID = backup.profiles[0].id
         profiles = backup.profiles
-        rules = backup.rules.filter { profileIDs.contains($0.profileID) }
+        rules = backup.rules
         if let preferences = backup.preferences {
             alwaysOnTop = preferences.alwaysOnTop
             showOnAllSpaces = preferences.showOnAllSpaces
@@ -800,6 +810,16 @@ final class NoteStore: ObservableObject {
               !profiles.isEmpty,
               Set(profiles.map(\.id)).count == profiles.count else { return nil }
         return profiles
+    }
+
+    private static func decodeRules(from data: Data,
+                                    validProfileIDs: Set<UUID>) -> [AppRule]? {
+        guard let rules = try? JSONDecoder().decode([AppRule].self, from: data),
+              Set(rules.map(\.id)).count == rules.count,
+              Set(rules.map(\.bundleIdentifier)).count == rules.count,
+              rules.allSatisfy({ !$0.bundleIdentifier.isEmpty && validProfileIDs.contains($0.profileID) })
+        else { return nil }
+        return rules
     }
 
     private static func makeEmptyProfile(named name: String) -> NoteProfile {

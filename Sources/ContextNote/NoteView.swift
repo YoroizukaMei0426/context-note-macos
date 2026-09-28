@@ -329,6 +329,8 @@ private struct ResizeHandle: NSViewRepresentable {
         private var startingFrame: NSRect?
         private var startingMouse: NSPoint?
 
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
         override func draw(_ dirtyRect: NSRect) {
             NSColor.white.withAlphaComponent(0.65).setStroke()
             for offset in [0.0, 5.0, 10.0] {
@@ -348,8 +350,15 @@ private struct ResizeHandle: NSViewRepresentable {
         override func mouseDragged(with event: NSEvent) {
             guard let window, let start = startingFrame, let mouse = startingMouse else { return }
             let point = NSEvent.mouseLocation
-            let width = max(window.minSize.width, start.width + point.x - mouse.x)
-            let height = max(window.minSize.height, start.height - point.y + mouse.y)
+            let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame
+            let maximumWidth = visibleFrame.map { max(window.minSize.width, $0.maxX - start.minX - 12) }
+                ?? CGFloat.greatestFiniteMagnitude
+            let maximumHeight = visibleFrame.map { max(window.minSize.height, start.maxY - $0.minY - 12) }
+                ?? CGFloat.greatestFiniteMagnitude
+            let width = min(maximumWidth,
+                            max(window.minSize.width, start.width + point.x - mouse.x))
+            let height = min(maximumHeight,
+                             max(window.minSize.height, start.height - point.y + mouse.y))
             window.setFrame(NSRect(x: start.minX, y: start.maxY - height,
                                    width: width, height: height), display: true)
         }

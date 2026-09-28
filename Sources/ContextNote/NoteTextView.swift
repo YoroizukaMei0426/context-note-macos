@@ -268,7 +268,12 @@ struct NoteTextView: NSViewRepresentable {
                 range.length += 1
             }
             performingTaskCompletionEdit = true
-            defer { performingTaskCompletionEdit = false }
+            let wasEditable = isEditable
+            if textIsLocked { isEditable = true }
+            defer {
+                isEditable = wasEditable
+                performingTaskCompletionEdit = false
+            }
             guard shouldChangeText(in: range, replacementString: "") else { return }
             textStorage?.replaceCharacters(in: range, with: "")
             didChangeText()

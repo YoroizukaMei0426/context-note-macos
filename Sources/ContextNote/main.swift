@@ -14,13 +14,15 @@ private final class NotePanel: NSPanel {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let store = NoteStore()
     private var window: NSWindow!
     private var hoverTimer: Timer?
     private var statusItem: NSStatusItem?
+    private var noteVisibilityMenuItem: NSMenuItem?
     private var visibilityTask: Task<Void, Never>?
     private var hiddenForFullscreen = true
+    private var hiddenByUser = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMenu()
@@ -51,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.panelWindow = panel
         store.windowBehaviorChanged = { [weak self] in self?.refreshFullscreenVisibility() }
         store.statusItemVisibilityChanged = { [weak self] in self?.updateStatusItemVisibility() }
+        store.noteHiddenByUser = { [weak self] in self?.hiddenByUser = true }
         // Polling the pointer works even while this nonactivating panel is not the frontmost app.
         hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.updateHover() }
@@ -119,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hiddenForFullscreen = shouldHide
         if shouldHide {
             window.orderOut(nil)
-        } else {
+        } else if !hiddenByUser {
             window.orderFrontRegardless()
         }
     }
@@ -186,6 +189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
+
+        let helpItem = NSMenuItem()
+        let helpMenu = NSMenu(title: "帮助")
+        let guideItem = NSMenuItem(title: "情境便签使用说明…", action: #selector(showHelp(_:)), keyEquivalent: "")
+        guideItem.target = self
+        helpMenu.addItem(guideItem)
+        helpItem.submenu = helpMenu
+        mainMenu.addItem(helpItem)
         NSApp.mainMenu = mainMenu
     }
 
@@ -193,9 +204,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "情境便签")
         let menu = NSMenu()
-        let showItem = NSMenuItem(title: "显示便签", action: #selector(showNote(_:)), keyEquivalent: "")
-        showItem.target = self
-        menu.addItem(showItem)
+        menu.delegate = self
+        let visibilityItem = NSMenuItem(title: "隐藏便签", action: #selector(toggleNoteVisibility(_:)), keyEquivalent: "")
+        visibilityItem.target = self
+        menu.addItem(visibilityItem)
+        noteVisibilityMenuItem = visibilityItem
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(showSettings(_:)), keyEquivalent: "")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -213,10 +226,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
+            noteVisibilityMenuItem = nil
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusItem?.menu else { return }
+        noteVisibilityMenuItem?.title = window.isVisible ? "隐藏便签" : "显示便签"
+    }
+
+    @objc private func toggleNoteVisibility(_ sender: Any?) {
+        if window.isVisible {
+            store.hideNote()
+        } else {
+            showNote(sender)
         }
     }
 
     @objc private func showNote(_ sender: Any?) {
+        hiddenByUser = false
         window.orderFrontRegardless()
     }
 
@@ -228,8 +256,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func quit(_ sender: Any?) { NSApp.terminate(nil) }
 
     @objc private func showSettings(_ sender: Any?) {
+        hiddenByUser = false
         store.showingSettings = true
         window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func showHelp(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "情境便签使用说明"
+        alert.informativeText = """
+        • 点击正文即可编辑；文字会自动保存。
+        • 从便签顶部拖动窗口，从右下角调整大小。
+        • 锁定按钮只锁定正文，任务完成按钮仍可使用。
+        • 齿轮用于管理便签和 App 关联，画笔用于调整外观。
+        • 左上角叉号只隐藏便签；从 Dock 或菜单栏可重新显示。
+        • 按 Command-Q，或从 Dock、菜单栏菜单中退出 App。
+        """
+        alert.addButton(withTitle: "知道了")
+        alert.window.level = .floating
+        alert.runModal()
     }
 
     func windowDidMove(_ notification: Notification) { persistFrame() }
