@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -26,6 +27,13 @@ struct NoteProfile: Identifiable, Codable {
     var glassStyle: GlassStyle? = nil
     var completedLineIndexes: [Int]? = nil
     var textLocked: Bool? = nil
+    var taskLinksEnabled: Bool? = nil
+    var taskLinks: [TaskLink]? = nil
+}
+
+struct TaskLink: Codable, Equatable {
+    var lineIndex: Int
+    var url: String
 }
 
 struct CodableColor: Codable, Equatable {
@@ -148,9 +156,13 @@ final class NoteStore: ObservableObject {
     var statusItemVisibilityChanged: (() -> Void)?
     var noteHiddenByUser: (() -> Void)?
     var editorSnapshot: (() -> (UUID, String)?)?
+    var clearTransientTaskUndo: (() -> Void)?
+    var performTransientTaskUndo: (() -> Bool)?
     @Published var isHovering = false
     @Published var showingAppearance = false
     @Published var showingSettings = false
+    @Published private(set) var backgroundRenderingSuspended = false
+    @Published private(set) var backgroundRenderRevision = 0
     @Published var alwaysOnTop: Bool {
         didSet {
             defaults.set(alwaysOnTop, forKey: Keys.alwaysOnTop)
@@ -202,6 +214,7 @@ final class NoteStore: ObservableObject {
     private var ignoredSuggestionIDs: Set<String>
     private var snoozedSuggestionIDs = Set<String>()
     private var imageCache: [UUID: NSImage] = [:]
+    private var backgroundDecodePixelLimit = 1536
     private var deferringTextPersistence = false
     private var textPersistenceTask: Task<Void, Never>?
     private var updatingLaunchAtLogin = false
@@ -211,12 +224,18 @@ final class NoteStore: ObservableObject {
     var text: String { activeProfile.text }
     var completedLineIndexes: Set<Int> { Set(activeProfile.completedLineIndexes ?? []) }
     var isTextLocked: Bool { activeProfile.textLocked ?? false }
+    var taskLinksEnabled: Bool { activeProfile.taskLinksEnabled ?? false }
+    var taskLinks: [Int: String] {
+        (activeProfile.taskLinks ?? []).reduce(into: [:]) { result, link in
+            result[link.lineIndex] = link.url
+        }
+    }
     var imageData: Data? { activeProfile.imageData }
     var backgroundImage: NSImage? {
         let profile = activeProfile
         guard let data = profile.imageData else { return nil }
         if let cached = imageCache[profile.id] { return cached }
-        let image = NSImage(data: data)
+        let image = Self.displayImage(from: data, maxPixelSize: backgroundDecodePixelLimit)
         imageCache[profile.id] = image
         return image
     }
@@ -243,7 +262,7 @@ final class NoteStore: ObservableObject {
             (activeProfile.textColor?.nsColor ?? .white)
     }
     var visibleBackgroundImage: NSImage? {
-        appearanceMode == .image ? backgroundImage : nil
+        appearanceMode == .image && !backgroundRenderingSuspended ? backgroundImage : nil
     }
     var recommendedTextColors: [NSColor] {
         if appearanceMode == .solid {
@@ -311,14 +330,17 @@ final class NoteStore: ObservableObject {
     func setText(_ value: String, for profileID: UUID) {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }),
               profiles[index].text != value else { return }
-        let reconciled = Self.reconcileCompletedLines(
-            oldText: profiles[index].text,
-            newText: value,
-            completed: Set(profiles[index].completedLineIndexes ?? [])
-        )
+        let oldText = profiles[index].text
+        let lineMapping = Self.lineIndexMapping(oldText: oldText, newText: value)
+        let reconciled = Set(profiles[index].completedLineIndexes ?? []).compactMap { lineMapping[$0] }
+        let reconciledLinks = (profiles[index].taskLinks ?? []).compactMap { link -> TaskLink? in
+            guard let newIndex = lineMapping[link.lineIndex] else { return nil }
+            return TaskLink(lineIndex: newIndex, url: link.url)
+        }
         deferringTextPersistence = true
         profiles[index].text = value
         profiles[index].completedLineIndexes = reconciled.sorted()
+        profiles[index].taskLinks = reconciledLinks.sorted { $0.lineIndex < $1.lineIndex }
         deferringTextPersistence = false
         textPersistenceTask?.cancel()
         textPersistenceTask = Task { [weak self] in
@@ -337,10 +359,34 @@ final class NoteStore: ObservableObject {
     }
     func hideNote() {
         flushText()
+        clearTransientTaskUndo?()
+        suspendBackgroundRendering()
         showingAppearance = false
         showingSettings = false
         noteHiddenByUser?()
         panelWindow?.orderOut(nil)
+    }
+
+    func suspendBackgroundRendering() {
+        guard !backgroundRenderingSuspended || !imageCache.isEmpty else { return }
+        backgroundRenderingSuspended = true
+        imageCache.removeAll(keepingCapacity: true)
+    }
+
+    func resumeBackgroundRendering() {
+        guard backgroundRenderingSuspended else { return }
+        backgroundRenderingSuspended = false
+    }
+
+    func handleMemoryPressure() {
+        if backgroundRenderingSuspended || appearanceMode != .image {
+            imageCache.removeAll(keepingCapacity: true)
+            return
+        }
+        guard backgroundDecodePixelLimit > 1024 else { return }
+        backgroundDecodePixelLimit = 1024
+        imageCache.removeAll(keepingCapacity: true)
+        backgroundRenderRevision &+= 1
     }
     func toggleCompletedLine(_ lineIndex: Int) {
         updateActive { profile in
@@ -352,7 +398,40 @@ final class NoteStore: ObservableObject {
 
     func toggleTextLock() {
         flushText()
+        clearTransientTaskUndo?()
         updateActive { $0.textLocked = !($0.textLocked ?? false) }
+    }
+
+    func setTaskLinksEnabled(_ enabled: Bool) {
+        flushText()
+        updateActive { $0.taskLinksEnabled = enabled }
+    }
+
+    func setTaskLink(_ value: String, for lineIndex: Int) {
+        setTaskLink(value, for: lineIndex, profileID: activeProfileID)
+    }
+
+    func setTaskLink(_ value: String, for lineIndex: Int, profileID: UUID) {
+        guard lineIndex >= 0 else { return }
+        guard let profileIndex = profiles.firstIndex(where: { $0.id == profileID }) else { return }
+        var links = profiles[profileIndex].taskLinks ?? []
+        links.removeAll { $0.lineIndex == lineIndex }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            links.append(TaskLink(lineIndex: lineIndex, url: trimmed))
+        }
+        profiles[profileIndex].taskLinks = links.sorted { $0.lineIndex < $1.lineIndex }
+    }
+
+    func openTaskLink(at lineIndex: Int) {
+        guard taskLinksEnabled,
+              let value = taskLinks[lineIndex],
+              let url = Self.webURL(from: value) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func isValidTaskLink(_ value: String) -> Bool {
+        Self.webURL(from: value) != nil
     }
 
     private func updateLaunchAtLoginRegistration() {
@@ -374,9 +453,7 @@ final class NoteStore: ObservableObject {
         }
     }
 
-    private static func reconcileCompletedLines(oldText: String, newText: String,
-                                                completed: Set<Int>) -> Set<Int> {
-        guard !completed.isEmpty else { return [] }
+    private static func lineIndexMapping(oldText: String, newText: String) -> [Int: Int] {
         let oldLines = oldText.components(separatedBy: "\n")
         let newLines = newText.components(separatedBy: "\n")
         let rows = oldLines.count, columns = newLines.count
@@ -390,10 +467,10 @@ final class NoteStore: ObservableObject {
                 }
             }
         }
-        var result = Set<Int>(), oldIndex = 0, newIndex = 0
+        var result: [Int: Int] = [:], oldIndex = 0, newIndex = 0
         while oldIndex < rows && newIndex < columns {
             if oldLines[oldIndex] == newLines[newIndex] {
-                if completed.contains(oldIndex) { result.insert(newIndex) }
+                result[oldIndex] = newIndex
                 oldIndex += 1; newIndex += 1
             } else if table[oldIndex + 1][newIndex] >= table[oldIndex][newIndex + 1] {
                 oldIndex += 1
@@ -401,11 +478,40 @@ final class NoteStore: ObservableObject {
                 newIndex += 1
             }
         }
+        // Keep metadata on a line whose wording changed in place. Exact matches
+        // remain the anchors, so inserting or deleting other lines still shifts
+        // their task state and links to the correct indexes.
+        let anchors = [(-1, -1)] + result.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+            + [(rows, columns)]
+        for pairIndex in 0..<(anchors.count - 1) {
+            let previous = anchors[pairIndex]
+            let next = anchors[pairIndex + 1]
+            let oldCount = next.0 - previous.0 - 1
+            let newCount = next.1 - previous.1 - 1
+            guard oldCount > 0, oldCount == newCount else { continue }
+            for offset in 1...oldCount {
+                result[previous.0 + offset] = previous.1 + offset
+            }
+        }
         return result
+    }
+
+    private static func webURL(from value: String) -> URL? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let candidate = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard let components = URLComponents(string: candidate),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              components.host?.isEmpty == false else { return nil }
+        return components.url
     }
     func setImageOpacity(_ value: Double) { updateActive { $0.imageOpacity = value } }
     func setImageLayout(_ value: ImageLayout) { updateActive { $0.imageLayout = value } }
-    func setImageZoom(_ value: Double) { updateActive { $0.imageZoom = value } }
+    func setImageZoom(_ value: Double) {
+        updateActive { $0.imageZoom = value }
+        if let panelWindow { updateBackgroundDecodeLimit(for: panelWindow) }
+    }
     func setImageOffsetX(_ value: Double) { updateActive { $0.imageOffsetX = value } }
     func setImageOffsetY(_ value: Double) { updateActive { $0.imageOffsetY = value } }
     func setImageBrightness(_ value: Double) { updateActive { $0.imageBrightness = value } }
@@ -548,8 +654,47 @@ final class NoteStore: ObservableObject {
 
     private func switchProfile(to id: UUID) {
         flushText()
+        clearTransientTaskUndo?()
         guard activeProfileID != id else { return }
+        // A decoded full-resolution background can occupy tens of megabytes.
+        // Keep only the current profile's image in memory; its original data
+        // remains stored on the profile and will be decoded again when needed.
+        imageCache.removeAll(keepingCapacity: true)
         activeProfileID = id
+        if let panelWindow { updateBackgroundDecodeLimit(for: panelWindow) }
+    }
+
+    func updateBackgroundDecodeLimit(for window: NSWindow) {
+        let longestSide = max(window.frame.width, window.frame.height)
+        let requiredPixels = longestSide * window.backingScaleFactor * max(1, imageZoom)
+        let nextLimit: Int
+        if requiredPixels <= 1200 {
+            nextLimit = 1536
+        } else if requiredPixels <= 2400 {
+            nextLimit = 3072
+        } else {
+            nextLimit = .max
+        }
+        guard nextLimit != backgroundDecodePixelLimit else { return }
+        backgroundDecodePixelLimit = nextLimit
+        imageCache.removeAll(keepingCapacity: true)
+    }
+
+    private static func displayImage(from data: Data, maxPixelSize: Int) -> NSImage? {
+        guard maxPixelSize != .max,
+              let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return NSImage(data: data)
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return NSImage(data: data) }
+        return NSImage(cgImage: thumbnail,
+                       size: NSSize(width: thumbnail.width, height: thumbnail.height))
     }
 
     func renameProfile(_ id: UUID, to name: String) {

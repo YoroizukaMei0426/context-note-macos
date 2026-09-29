@@ -3,7 +3,18 @@ import CoreGraphics
 import SwiftUI
 
 private final class NotePanel: NSPanel {
+    var handleLockedUndo: ((Bool) -> Bool)?
     override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.charactersIgnoringModifiers?.lowercased() == "z",
+           modifiers.contains(.command),
+           handleLockedUndo?(modifiers.contains(.shift)) == true {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     override func sendEvent(_ event: NSEvent) {
         if event.type == .leftMouseDown && level == .normal {
@@ -21,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var statusItem: NSStatusItem?
     private var noteVisibilityMenuItem: NSMenuItem?
     private var visibilityTask: Task<Void, Never>?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var hiddenForFullscreen = true
     private var hiddenByUser = false
 
@@ -34,6 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             backing: .buffered,
             defer: false
         )
+        panel.handleLockedUndo = { [weak self] isRedo in
+            guard let self, store.isTextLocked else { return false }
+            if !isRedo { _ = store.performTransientTaskUndo?() }
+            return true
+        }
         panel.title = "情境便签"
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -47,13 +64,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                     .fullScreenAuxiliary, .stationary]
         panel.minSize = NSSize(width: 240, height: 200)
         panel.isMovableByWindowBackground = false
-        panel.contentView = NSHostingView(rootView: NoteView(store: store))
-        panel.delegate = self
         window = panel
         store.panelWindow = panel
+        store.updateBackgroundDecodeLimit(for: panel)
+        panel.contentView = NSHostingView(rootView: NoteView(store: store))
+        panel.delegate = self
         store.windowBehaviorChanged = { [weak self] in self?.refreshFullscreenVisibility() }
         store.statusItemVisibilityChanged = { [weak self] in self?.updateStatusItemVisibility() }
         store.noteHiddenByUser = { [weak self] in self?.hiddenByUser = true }
+        let pressureSource = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        pressureSource.setEventHandler { [weak self] in
+            Task { @MainActor in self?.store.handleMemoryPressure() }
+        }
+        pressureSource.resume()
+        memoryPressureSource = pressureSource
         // Polling the pointer works even while this nonactivating panel is not the frontmost app.
         hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.updateHover() }
@@ -121,8 +148,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard shouldHide != hiddenForFullscreen else { return }
         hiddenForFullscreen = shouldHide
         if shouldHide {
+            store.suspendBackgroundRendering()
             window.orderOut(nil)
         } else if !hiddenByUser {
+            store.resumeBackgroundRendering()
             window.orderFrontRegardless()
         }
     }
@@ -223,10 +252,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func updateStatusItemVisibility() {
         if store.showStatusItem {
             if statusItem == nil { installStatusItem() }
+            NSApp.setActivationPolicy(.accessory)
         } else if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
             noteVisibilityMenuItem = nil
+            NSApp.setActivationPolicy(.regular)
+        } else {
+            NSApp.setActivationPolicy(.regular)
         }
     }
 
@@ -245,6 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func showNote(_ sender: Any?) {
         hiddenByUser = false
+        store.resumeBackgroundRendering()
         window.orderFrontRegardless()
     }
 
@@ -271,7 +305,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         • 从便签顶部拖动窗口，从右下角调整大小。
         • 锁定按钮只锁定正文，任务完成按钮仍可使用。
         • 齿轮用于管理便签和 App 关联，画笔用于调整外观。
-        • 左上角叉号只隐藏便签；从 Dock 或菜单栏可重新显示。
+        • 左上角叉号只隐藏便签；右键叉号可以退出 App。
+        • 显示菜单栏图标时会隐藏 Dock 图标；关闭菜单栏图标时会恢复 Dock 图标。
         • 按 Command-Q，或从 Dock、菜单栏菜单中退出 App。
         """
         alert.addButton(withTitle: "知道了")
@@ -280,7 +315,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func windowDidMove(_ notification: Notification) { persistFrame() }
-    func windowDidResize(_ notification: Notification) { persistFrame() }
+    func windowDidResize(_ notification: Notification) {
+        if let window { store.updateBackgroundDecodeLimit(for: window) }
+        persistFrame()
+    }
     func applicationWillTerminate(_ notification: Notification) { store.flushText() }
 
     private func persistFrame() {

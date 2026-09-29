@@ -21,6 +21,11 @@ struct NoteView: View {
                     }
                     .buttonStyle(.plain)
                     .help("隐藏便签（App 继续运行）")
+                    .contextMenu {
+                        Button("隐藏便签") { store.hideNote() }
+                        Divider()
+                        Button("退出情境便签") { NSApp.terminate(nil) }
+                    }
                     .allowsHitTesting(showToolbar)
 
                     ZStack(alignment: .leading) {

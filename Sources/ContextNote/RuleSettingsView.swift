@@ -27,7 +27,49 @@ struct RuleSettingsView: View {
                         Text(behavior.title).tag(behavior)
                     }
                 }
+                .pickerStyle(.segmented)
                 .font(.caption)
+                Toggle("点击任务文字打开链接", isOn: Binding(
+                    get: { store.taskLinksEnabled },
+                    set: { store.setTaskLinksEnabled($0) }
+                ))
+                .font(.caption)
+                if store.taskLinksEnabled {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("当前便签的任务链接")
+                            .font(.caption.weight(.semibold))
+                        Text("网址可以省略 https://。没有填写网址的任务仍可正常编辑。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        ForEach(taskLines, id: \.index) { item in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.text)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                HStack(spacing: 5) {
+                                    TextField("网址", text: Binding(
+                                        get: { store.taskLinks[item.index] ?? "" },
+                                        set: { store.setTaskLink($0, for: item.index) }
+                                    ))
+                                    let link = store.taskLinks[item.index] ?? ""
+                                    if !link.isEmpty {
+                                        Image(systemName: store.isValidTaskLink(link)
+                                              ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                                            .foregroundStyle(store.isValidTaskLink(link) ? .green : .orange)
+                                            .help(store.isValidTaskLink(link) ? "网址有效" : "请输入有效的网址")
+                                    }
+                                }
+                            }
+                        }
+                        if taskLines.isEmpty {
+                            Text("先在便签正文中写下任务。")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(9)
+                    .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+                }
                 Toggle("建议为新 App 创建便签", isOn: $store.suggestionsEnabled)
                     .font(.caption)
                 Toggle("未关联 App 全屏时显示便签", isOn: $store.defaultShowInFullscreen)
@@ -137,6 +179,13 @@ struct RuleSettingsView: View {
         }
         .onHover { hovering in
             if hovering { NSCursor.arrow.set() }
+        }
+    }
+
+    private var taskLines: [(index: Int, text: String)] {
+        store.text.components(separatedBy: "\n").enumerated().compactMap { index, line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : (index, trimmed)
         }
     }
 }

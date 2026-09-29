@@ -35,11 +35,26 @@ struct NoteTextView: NSViewRepresentable {
         editor.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         editor.applyTextColor(store.textColor)
         editor.completedLineIndexes = store.completedLineIndexes
+        editor.taskLinksEnabled = store.taskLinksEnabled
+        editor.taskLinks = store.taskLinks
         editor.textIsLocked = store.isTextLocked
         editor.showCompletionButtons = showsHoverControls
         editor.onCompleteLine = { [weak coordinator = context.coordinator, weak editor] lineIndex in
             guard let editor else { return }
             coordinator?.completeLine(lineIndex, in: editor)
+        }
+        editor.onOpenTaskLink = { [weak coordinator = context.coordinator] lineIndex in
+            coordinator?.store.openTaskLink(at: lineIndex)
+        }
+        editor.onRestoreTaskLink = { [weak coordinator = context.coordinator, weak editor] lineIndex, url in
+            guard let profileID = editor?.profileID else { return }
+            DispatchQueue.main.async {
+                coordinator?.store.setTaskLink(url, for: lineIndex, profileID: profileID)
+            }
+        }
+        editor.onUndoStrikethrough = { [weak coordinator = context.coordinator, weak editor] lineIndex in
+            guard let coordinator, let editor else { return }
+            coordinator.undoStrikethrough(lineIndex, in: editor)
         }
         editor.delegate = context.coordinator
         editor.profileID = store.activeProfileID
@@ -47,6 +62,12 @@ struct NoteTextView: NSViewRepresentable {
         store.editorSnapshot = { [weak editor] in
             guard let editor, let id = editor.profileID else { return nil }
             return (id, editor.string)
+        }
+        store.clearTransientTaskUndo = { [weak editor] in
+            editor?.clearTransientTaskUndo()
+        }
+        store.performTransientTaskUndo = { [weak editor] in
+            editor?.performTransientTaskUndo() ?? false
         }
         return scrollView
     }
@@ -64,6 +85,8 @@ struct NoteTextView: NSViewRepresentable {
         editor.profileID = store.activeProfileID
         editor.applyTextColor(store.textColor)
         editor.completedLineIndexes = store.completedLineIndexes
+        editor.taskLinksEnabled = store.taskLinksEnabled
+        editor.taskLinks = store.taskLinks
         editor.textIsLocked = store.isTextLocked
         editor.showCompletionButtons = showsHoverControls
         editor.applyCompletionStyles()
@@ -86,12 +109,19 @@ struct NoteTextView: NSViewRepresentable {
         fileprivate func completeLine(_ lineIndex: Int, in editor: NoteEditor) {
             switch store.completionBehavior {
             case .strikethrough:
+                editor.recordStrikethroughToggle(lineIndex)
                 store.toggleCompletedLine(lineIndex)
                 editor.completedLineIndexes = store.completedLineIndexes
                 editor.applyCompletionStyles()
             case .delete:
-                editor.deleteLogicalLine(lineIndex)
+                editor.deleteLogicalLine(lineIndex, taskLink: store.taskLinks[lineIndex])
             }
+        }
+
+        fileprivate func undoStrikethrough(_ lineIndex: Int, in editor: NoteEditor) {
+            store.toggleCompletedLine(lineIndex)
+            editor.completedLineIndexes = store.completedLineIndexes
+            editor.applyCompletionStyles()
         }
     }
 
@@ -100,6 +130,8 @@ struct NoteTextView: NSViewRepresentable {
         var profileID: UUID?
         var isApplyingStoredContent: Bool { performingProgrammaticTextChange }
         var completedLineIndexes = Set<Int>() { didSet { needsDisplay = true } }
+        var taskLinksEnabled = false { didSet { refreshCompletionControls() } }
+        var taskLinks: [Int: String] = [:] { didSet { refreshCompletionControls() } }
         var showCompletionButtons = false {
             didSet { refreshCompletionControls() }
         }
@@ -119,9 +151,29 @@ struct NoteTextView: NSViewRepresentable {
         private var performingTaskCompletionEdit = false
         private var performingProgrammaticTextChange = false
         private var lockedTextSnapshot = ""
+        private var pendingLockedDeletion: PendingLockedDeletion?
+        private var pendingLockedStrikethrough: PendingLockedStrikethrough?
         private var completionControlsAreVisible: Bool { showCompletionButtons || pointerIsInside }
         var onCompleteLine: ((Int) -> Void)?
+        var onOpenTaskLink: ((Int) -> Void)?
+        var onRestoreTaskLink: ((Int, String) -> Void)?
+        var onUndoStrikethrough: ((Int) -> Void)?
         override var mouseDownCanMoveWindow: Bool { false }
+
+        private struct PendingLockedDeletion {
+            var lineIndex: Int
+            var insertionLocation: Int
+            var text: String
+            var taskLink: String?
+            var deletedAt: Date
+        }
+
+        private struct PendingLockedStrikethrough {
+            var lineIndex: Int
+            var changedAt: Date
+        }
+
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
         override var string: String {
             get { super.string }
@@ -218,6 +270,8 @@ struct NoteTextView: NSViewRepresentable {
             if completionControlsAreVisible,
                completionButtonRects().contains(where: { $0.rect.contains(point) }) {
                 NSCursor.pointingHand.set()
+            } else if linkedLine(at: point) != nil {
+                NSCursor.pointingHand.set()
             } else {
                 (textIsLocked ? NSCursor.arrow : NSCursor.iBeam).set()
             }
@@ -235,30 +289,56 @@ struct NoteTextView: NSViewRepresentable {
             typingAttributes[.foregroundColor] = color
             let range = NSRange(location: 0, length: (string as NSString).length)
             if range.length > 0 {
-                textStorage?.addAttribute(.foregroundColor, value: color, range: range)
+                withoutUndoRegistration {
+                    textStorage?.addAttribute(.foregroundColor, value: color, range: range)
+                }
             }
             needsDisplay = true
         }
 
         func applyCompletionStyles() {
             guard let textStorage else { return }
-            let fullRange = NSRange(location: 0, length: (string as NSString).length)
-            if fullRange.length > 0 {
-                textStorage.removeAttribute(.strikethroughStyle, range: fullRange)
-            }
-            for (lineIndex, range) in logicalLineRanges().enumerated()
-                where completedLineIndexes.contains(lineIndex) {
-                let contentRange = rangeWithoutLineBreak(range)
-                if contentRange.length > 0 {
-                    textStorage.addAttribute(.strikethroughStyle,
-                                             value: NSUnderlineStyle.single.rawValue,
-                                             range: contentRange)
+            withoutUndoRegistration {
+                let fullRange = NSRange(location: 0, length: (string as NSString).length)
+                if fullRange.length > 0 {
+                    textStorage.removeAttribute(.strikethroughStyle, range: fullRange)
+                    textStorage.removeAttribute(.underlineStyle, range: fullRange)
+                }
+                if taskLinksEnabled {
+                    for (lineIndex, range) in logicalLineRanges().enumerated()
+                        where taskLinks[lineIndex] != nil && !completedLineIndexes.contains(lineIndex) {
+                        let contentRange = rangeWithoutLineBreak(range)
+                        if contentRange.length > 0 {
+                            textStorage.addAttribute(.underlineStyle,
+                                                     value: NSUnderlineStyle.single.rawValue,
+                                                     range: contentRange)
+                        }
+                    }
+                }
+                for (lineIndex, range) in logicalLineRanges().enumerated()
+                    where completedLineIndexes.contains(lineIndex) {
+                    let contentRange = rangeWithoutLineBreak(range)
+                    if contentRange.length > 0 {
+                        textStorage.addAttribute(.strikethroughStyle,
+                                                 value: NSUnderlineStyle.single.rawValue,
+                                                 range: contentRange)
+                    }
                 }
             }
             needsDisplay = true
         }
 
-        func deleteLogicalLine(_ lineIndex: Int) {
+        private func withoutUndoRegistration(_ changes: () -> Void) {
+            guard let undoManager, undoManager.isUndoRegistrationEnabled else {
+                changes()
+                return
+            }
+            undoManager.disableUndoRegistration()
+            defer { undoManager.enableUndoRegistration() }
+            changes()
+        }
+
+        func deleteLogicalLine(_ lineIndex: Int, taskLink: String?) {
             let ranges = logicalLineRanges()
             guard ranges.indices.contains(lineIndex) else { return }
             var range = ranges[lineIndex]
@@ -267,6 +347,9 @@ struct NoteTextView: NSViewRepresentable {
                 range.location -= 1
                 range.length += 1
             }
+            let deletedText = (string as NSString).substring(with: range)
+            pendingLockedDeletion = nil
+            pendingLockedStrikethrough = nil
             performingTaskCompletionEdit = true
             let wasEditable = isEditable
             if textIsLocked { isEditable = true }
@@ -274,16 +357,159 @@ struct NoteTextView: NSViewRepresentable {
                 isEditable = wasEditable
                 performingTaskCompletionEdit = false
             }
-            guard shouldChangeText(in: range, replacementString: "") else { return }
-            textStorage?.replaceCharacters(in: range, with: "")
+            var changed = false
+            withoutUndoRegistration {
+                guard shouldChangeText(in: range, replacementString: "") else { return }
+                textStorage?.replaceCharacters(in: range, with: "")
+                didChangeText()
+                changed = true
+            }
+            guard changed else { return }
+            let deletion = PendingLockedDeletion(
+                lineIndex: lineIndex,
+                insertionLocation: range.location,
+                text: deletedText,
+                taskLink: taskLink,
+                deletedAt: Date()
+            )
+            if textIsLocked {
+                pendingLockedDeletion = deletion
+            } else {
+                registerUnlockedDeletionUndo(deletion)
+            }
+        }
+
+        func clearTransientTaskUndo() {
+            pendingLockedDeletion = nil
+            pendingLockedStrikethrough = nil
+        }
+
+        func recordStrikethroughToggle(_ lineIndex: Int) {
+            if textIsLocked {
+                pendingLockedDeletion = nil
+                pendingLockedStrikethrough = PendingLockedStrikethrough(
+                    lineIndex: lineIndex,
+                    changedAt: Date()
+                )
+            } else {
+                registerUnlockedStrikethroughUndo(lineIndex)
+            }
+        }
+
+        func performTransientTaskUndo() -> Bool {
+            if pendingLockedDeletion != nil { return restorePendingLockedDeletion() }
+            guard let pending = pendingLockedStrikethrough else { return false }
+            pendingLockedStrikethrough = nil
+            guard Date().timeIntervalSince(pending.changedAt) <= 5 else { return false }
+            onUndoStrikethrough?(pending.lineIndex)
+            return true
+        }
+
+        private func restorePendingLockedDeletion() -> Bool {
+            guard let pending = pendingLockedDeletion else { return false }
+            pendingLockedDeletion = nil
+            guard Date().timeIntervalSince(pending.deletedAt) <= 5,
+                  pending.insertionLocation <= (string as NSString).length else { return false }
+            let range = NSRange(location: pending.insertionLocation, length: 0)
+            performingTaskCompletionEdit = true
+            let wasEditable = isEditable
+            isEditable = true
+            undoManager?.disableUndoRegistration()
+            defer {
+                undoManager?.enableUndoRegistration()
+                isEditable = wasEditable
+                performingTaskCompletionEdit = false
+            }
+            guard shouldChangeText(in: range, replacementString: pending.text) else { return false }
+            textStorage?.replaceCharacters(in: range, with: pending.text)
+            let restoredRange = NSRange(location: range.location,
+                                        length: (pending.text as NSString).length)
             didChangeText()
+            if restoredRange.length > 0 {
+                let bodyFont = NSFont.systemFont(ofSize: 17)
+                textStorage?.addAttributes(
+                    [.font: bodyFont,
+                     .foregroundColor: textColor ?? NSColor.white],
+                    range: restoredRange
+                )
+                typingAttributes[.font] = bodyFont
+                needsLayout = true
+                needsDisplay = true
+            }
+            if let taskLink = pending.taskLink {
+                onRestoreTaskLink?(pending.lineIndex, taskLink)
+            }
+            return true
+        }
+
+        private func registerUnlockedDeletionUndo(_ deletion: PendingLockedDeletion) {
+            undoManager?.registerUndo(withTarget: self) { editor in
+                editor.restoreUnlockedDeletion(deletion)
+            }
+            undoManager?.setActionName("完成任务")
+        }
+
+        private func restoreUnlockedDeletion(_ deletion: PendingLockedDeletion) {
+            guard deletion.insertionLocation <= (string as NSString).length else { return }
+            let range = NSRange(location: deletion.insertionLocation, length: 0)
+            performingTaskCompletionEdit = true
+            defer { performingTaskCompletionEdit = false }
+            withoutUndoRegistration {
+                guard shouldChangeText(in: range, replacementString: deletion.text) else { return }
+                textStorage?.replaceCharacters(in: range, with: deletion.text)
+                let restoredRange = NSRange(location: range.location,
+                                            length: (deletion.text as NSString).length)
+                didChangeText()
+                if restoredRange.length > 0 {
+                    textStorage?.addAttributes(
+                        [.font: NSFont.systemFont(ofSize: 17),
+                         .foregroundColor: textColor ?? NSColor.white],
+                        range: restoredRange
+                    )
+                }
+            }
+            if let taskLink = deletion.taskLink {
+                onRestoreTaskLink?(deletion.lineIndex, taskLink)
+            }
+            undoManager?.registerUndo(withTarget: self) { editor in
+                editor.redoUnlockedDeletion(deletion)
+            }
+            undoManager?.setActionName("完成任务")
+        }
+
+        private func redoUnlockedDeletion(_ deletion: PendingLockedDeletion) {
+            let range = NSRange(location: deletion.insertionLocation,
+                                length: (deletion.text as NSString).length)
+            guard NSMaxRange(range) <= (string as NSString).length else { return }
+            performingTaskCompletionEdit = true
+            defer { performingTaskCompletionEdit = false }
+            withoutUndoRegistration {
+                guard shouldChangeText(in: range, replacementString: "") else { return }
+                textStorage?.replaceCharacters(in: range, with: "")
+                didChangeText()
+            }
+            registerUnlockedDeletionUndo(deletion)
+        }
+
+        private func registerUnlockedStrikethroughUndo(_ lineIndex: Int) {
+            undoManager?.registerUndo(withTarget: self) { editor in
+                editor.onUndoStrikethrough?(lineIndex)
+                editor.registerUnlockedStrikethroughUndo(lineIndex)
+            }
+            undoManager?.setActionName("完成任务")
         }
 
         override func mouseDown(with event: NSEvent) {
             let point = convert(event.locationInWindow, from: nil)
             if completionControlsAreVisible,
                let lineIndex = completionButtonRects().first(where: { $0.rect.contains(point) })?.lineIndex {
+                clearTransientTaskUndo()
                 onCompleteLine?(lineIndex)
+                return
+            }
+            if textIsLocked { clearTransientTaskUndo() }
+            if let lineIndex = linkedLine(at: point) {
+                onOpenTaskLink?(lineIndex)
                 return
             }
             if textIsLocked {
@@ -323,6 +549,11 @@ struct NoteTextView: NSViewRepresentable {
                                      height: bounds.height)
             addCursorRect(textRect, cursor: textIsLocked ? .arrow : .iBeam)
             addCursorRect(buttonStrip, cursor: .arrow)
+            if taskLinksEnabled {
+                for item in linkedLineRects() {
+                    addCursorRect(item.rect, cursor: .pointingHand)
+                }
+            }
             for button in completionButtonRects() {
                 addCursorRect(button.rect, cursor: .pointingHand)
             }
@@ -373,6 +604,29 @@ struct NoteTextView: NSViewRepresentable {
                 return (lineIndex, NSRect(x: max(0, visibleWidth - size - 4),
                                           y: fragment.midY + origin.y - size / 2,
                                           width: size, height: size))
+            }
+        }
+
+        private func linkedLine(at point: NSPoint) -> Int? {
+            guard taskLinksEnabled else { return nil }
+            return linkedLineRects().first(where: { $0.rect.contains(point) })?.lineIndex
+        }
+
+        private func linkedLineRects() -> [(lineIndex: Int, rect: NSRect)] {
+            guard taskLinksEnabled, let layoutManager, let textContainer else { return [] }
+            layoutManager.ensureLayout(for: textContainer)
+            let origin = textContainerOrigin
+            return logicalLineRanges().enumerated().compactMap { lineIndex, range in
+                guard taskLinks[lineIndex] != nil,
+                      !completedLineIndexes.contains(lineIndex) else { return nil }
+                let contentRange = rangeWithoutLineBreak(range)
+                guard contentRange.length > 0 else { return nil }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: contentRange,
+                                                          actualCharacterRange: nil)
+                var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                rect.origin.x += origin.x
+                rect.origin.y += origin.y
+                return (lineIndex, rect.insetBy(dx: -2, dy: -2))
             }
         }
 
