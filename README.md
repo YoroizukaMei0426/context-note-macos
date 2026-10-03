@@ -2,10 +2,6 @@
 
 原生 macOS SwiftUI + AppKit 单窗口便签。包含透明无标题栏浮动窗口、便签拖动、窗口缩放及位置尺寸保存、多行文字编辑及自动保存、背景图片与透明度、原生毛玻璃。第二阶段现已加入多个便签 Profile、手动 App 关联、前台 App 驱动的单窗口内容切换，以及轻量的关联建议。
 
-<p align="center">
-  <img src="docs/contextnote-preview.png" alt="ContextNote 1.0.2 界面预览" width="900">
-</p>
-
 ## 构建与运行
 
 需要 macOS 14 或更新版本以及 Swift Command Line Tools。在项目目录运行：
